@@ -94,7 +94,7 @@ static uint8_t led_states[2];
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_405 "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-#define SENSOR_JSON_MAX_POINTS 16U
+#define SENSOR_JSON_MAX_POINTS 4U
 
 static const unsigned char index_html[] = {
 #if defined(HTTP_SERVER_INDEX_HTML_INC)
