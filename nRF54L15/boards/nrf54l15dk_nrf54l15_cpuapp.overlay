@@ -1,3 +1,6 @@
+#include <zephyr/dt-bindings/adc/adc.h>
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+
 &pinctrl {
     my_i2c_pins: my_i2c_pins {
         group1 {
@@ -35,5 +38,26 @@
     vl53l0x@29 {
         compatible = "st,vl53l0x";
         reg = <0x29>;
+    };
+};
+
+/ {
+    zephyr,user {
+        io-channels = <&adc 0>;
+    };
+};
+
+&adc {
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    channel@0 {
+        reg = <0>;
+        zephyr,gain = "ADC_GAIN_1_6";
+        zephyr,reference = "ADC_REF_INTERNAL";
+        zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+        zephyr,input-positive = <NRF_SAADC_AIN0>;
+        zephyr,resolution = <12>;
     };
 };
