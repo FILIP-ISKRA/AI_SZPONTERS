@@ -47,6 +47,46 @@ config HTTP_SERVER_SAMPLE_RECEIVE_BUFFER_SIZE
 	help
 	  This option sets the receive buffer size for the sockets used in the sample.
 
+config HTTP_SERVER_SAMPLE_BLE_SCAN
+	bool "Enable BLE scanner"
+	depends on BT
+	default n
+	help
+	  Enable continuous Bluetooth LE scanning in observer role.
+
+if HTTP_SERVER_SAMPLE_BLE_SCAN
+
+config HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME
+	bool "Filter by BLE device name"
+	default y
+	help
+	  Match advertising packets when the decoded device name contains
+	  the configured filter string.
+
+config HTTP_SERVER_SAMPLE_BLE_NAME_FILTER
+	string "BLE name filter"
+	default "SZPON"
+	depends on HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME
+	help
+	  Substring used to match device names in advertisement data.
+
+config HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID
+	bool "Filter by BLE Company ID"
+	default y
+	help
+	  Match advertising packets containing manufacturer data with
+	  the configured Bluetooth SIG Company Identifier.
+
+config HTTP_SERVER_SAMPLE_BLE_COMPANY_ID
+	hex "BLE Company ID"
+	default 0x0059
+	depends on HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID
+	range 0x0000 0xFFFF
+	help
+	  Bluetooth SIG Company Identifier used to match manufacturer data.
+
+endif
+
 module = HTTP_SERVER_SAMPLE
 module-str = HTTP server sample
 source "$(ZEPHYR_BASE)/subsys/logging/Kconfig.template.log_config"

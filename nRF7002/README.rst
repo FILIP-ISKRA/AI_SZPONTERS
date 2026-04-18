@@ -28,6 +28,10 @@ Overview
 The sample supports managing the state of **LED 1** and **LED 2** on a compatible development kit.
 This feature allows you to both set and retrieve the current state of the LEDs through HTTP calls from a REST client.
 
+For boards with Bluetooth LE support, the sample can also run a continuous BLE scan in observer mode.
+The scanner listens to nearby devices and reports only those that match either a configured device name
+substring or a configured Bluetooth SIG Company Identifier (Company ID) in manufacturer data.
+
 Moreover, the sample also offers the option to enable TLS for secure communication.
 You can configure TLS with or without server and/or device authentication based on your security requirements.
 
@@ -183,6 +187,15 @@ CONFIG_HTTP_SERVER_SAMPLE_STACK_SIZE
 
 CONFIG_HTTP_SERVER_SAMPLE_RECEIVE_BUFFER_SIZE
    This configuration option sets the receive buffer size for the sockets used in the sample.
+
+CONFIG_HTTP_SERVER_SAMPLE_BLE_SCAN
+   Enables continuous Bluetooth LE scanning in observer mode.
+
+CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME and CONFIG_HTTP_SERVER_SAMPLE_BLE_NAME_FILTER
+   Enable and configure filtering by device name substring.
+
+CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID and CONFIG_HTTP_SERVER_SAMPLE_BLE_COMPANY_ID
+   Enable and configure filtering by Bluetooth SIG Company Identifier.
 
 .. include:: /includes/wifi_credentials_shell.txt
 
