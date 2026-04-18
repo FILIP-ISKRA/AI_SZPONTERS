@@ -178,7 +178,10 @@
 	</main>
 
 	<script>
-		const MAX_POINTS = 4;
+		const MAX_POINTS = 8;
+		const SENSOR_BIN_MAGIC = 0x31534e53;
+		const SENSOR_HEADER_SIZE = 8;
+		const SENSOR_SAMPLE_SIZE = 16;
 
 		const charts = [
 			{ key: "temperature", canvas: "cTemp", value: "vTemp", unit: "degC", color: "#ff6b35" },
@@ -261,18 +264,65 @@
 			});
 		}
 
+		function parseBinaryPayload(buffer) {
+			const view = new DataView(buffer);
+
+			if (view.byteLength < SENSOR_HEADER_SIZE) {
+				throw new Error("payload too short");
+			}
+
+			const magic = view.getUint32(0, true);
+			if (magic !== SENSOR_BIN_MAGIC) {
+				throw new Error("invalid binary magic");
+			}
+
+			const count = view.getUint16(4, true);
+			const sampleSize = view.getUint16(6, true);
+
+			if (sampleSize !== SENSOR_SAMPLE_SIZE) {
+				throw new Error("unsupported sample size");
+			}
+
+			const expected = SENSOR_HEADER_SIZE + (count * sampleSize);
+			if (view.byteLength < expected) {
+				throw new Error("truncated payload");
+			}
+
+			const out = {
+				count,
+				temperature: [],
+				humidity: [],
+				pressure: [],
+				light: [],
+			};
+
+			let offset = SENSOR_HEADER_SIZE;
+			for (let i = 0; i < count; i += 1) {
+				out.temperature.push(view.getFloat32(offset, true));
+				offset += 4;
+				out.humidity.push(view.getFloat32(offset, true));
+				offset += 4;
+				out.pressure.push(view.getFloat32(offset, true));
+				offset += 4;
+				out.light.push(view.getFloat32(offset, true));
+				offset += 4;
+			}
+
+			return out;
+		}
+
 		async function refreshData() {
 			const status = document.getElementById("status");
 			const meta = document.getElementById("meta");
 			status.textContent = "Odswiezanie...";
 
 			try {
-				const res = await fetch("/api/sensors", { cache: "no-store" });
+				const res = await fetch("/api/sensors.bin", { cache: "no-store" });
 				if (!res.ok) {
 					throw new Error("HTTP " + res.status);
 				}
 
-				const data = await res.json();
+				const data = parseBinaryPayload(await res.arrayBuffer());
 				updateValues(data);
 				meta.textContent = "Probki: " + (data.count || 0);
 				status.textContent = "OK";

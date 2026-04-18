@@ -94,7 +94,10 @@ static uint8_t led_states[2];
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_405 "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-#define SENSOR_JSON_MAX_POINTS 4U
+#define SENSOR_JSON_MAX_POINTS 8U
+#define SENSOR_BIN_MAGIC 0x31534E53U /* "SNS1" (little-endian) */
+#define SENSOR_BIN_HEADER_SIZE 8U
+#define SENSOR_BIN_SAMPLE_SIZE 16U
 
 static const unsigned char index_html[] = {
 #if defined(HTTP_SERVER_INDEX_HTML_INC)
@@ -290,14 +293,29 @@ static int send_response_raw(struct http_req *request, const char *response, siz
 {
 	ssize_t out_len;
 	size_t sent = 0;
+	int retry_count = 0;
+	const int max_retries = 20;
 
 	while (sent < len) {
 		out_len = send(request->socket, response + sent, len - sent, 0);
 		if (out_len < 0) {
-			LOG_ERR("send, error: %d", -errno);
-			return -errno;
+			int err = errno;
+
+			if ((err == ENOMEM || err == EAGAIN) && retry_count < max_retries) {
+				retry_count++;
+				k_msleep(5);
+				continue;
+			}
+
+			LOG_ERR("send, error: %d", -err);
+			return -err;
 		}
 
+		if (out_len == 0) {
+			return -ECONNRESET;
+		}
+
+		retry_count = 0;
 		sent += out_len;
 	}
 
@@ -330,93 +348,25 @@ static int send_index_response(struct http_req *request)
 	return send_response_raw(request, (const char *)index_html, INDEX_HTML_LEN);
 }
 
-enum sensor_field {
-	SENSOR_FIELD_TEMPERATURE,
-	SENSOR_FIELD_HUMIDITY,
-	SENSOR_FIELD_PRESSURE,
-	SENSOR_FIELD_LIGHT,
-};
-
-static double sensor_field_value(const struct sensor_sample *sample, enum sensor_field field)
-{
-	switch (field) {
-	case SENSOR_FIELD_TEMPERATURE:
-		return sample->temperature;
-	case SENSOR_FIELD_HUMIDITY:
-		return sample->humidity;
-	case SENSOR_FIELD_PRESSURE:
-		return sample->pressure;
-	case SENSOR_FIELD_LIGHT:
-		return sample->light;
-	default:
-		return 0.0;
-	}
-}
-
-static int send_sensor_series_json(struct http_req *request,
-				   const char *name,
-				   enum sensor_field field,
-				   size_t points,
-				   bool trailing_comma)
-{
-	int ret;
-	char chunk[96];
-
-	ret = snprintk(chunk, sizeof(chunk), "\"%s\":[", name);
-	if ((ret < 0) || (ret >= sizeof(chunk))) {
-		return -ENOBUFS;
-	}
-
-	ret = send_response_raw(request, chunk, ret);
-	if (ret) {
-		return ret;
-	}
-
-	for (size_t i = points; i > 0; i--) {
-		struct sensor_sample sample;
-		double value;
-
-		if (!sensor_ringbuffer_get_latest(&sensor_data, i - 1U, &sample)) {
-			return -ENOENT;
-		}
-
-		value = sensor_field_value(&sample, field);
-
-		ret = snprintk(chunk, sizeof(chunk), (i == points) ? "%.2f" : ",%.2f", value);
-		if ((ret < 0) || (ret >= sizeof(chunk))) {
-			return -ENOBUFS;
-		}
-
-		ret = send_response_raw(request, chunk, ret);
-		if (ret) {
-			return ret;
-		}
-	}
-
-	if (trailing_comma) {
-		ret = send_response_raw(request, "],", 2);
-	} else {
-		ret = send_response_raw(request, "]", 1);
-	}
-
-	return ret;
-}
-
 static int send_sensor_data_response(struct http_req *request)
 {
 	int ret;
-	char header[144];
-	char prefix[64];
+	char header[176];
+	uint8_t meta[SENSOR_BIN_HEADER_SIZE];
 	size_t points = sensor_ringbuffer_size(&sensor_data);
+	unsigned int payload_len;
 
 	if (points > SENSOR_JSON_MAX_POINTS) {
 		points = SENSOR_JSON_MAX_POINTS;
 	}
 
+	payload_len = SENSOR_BIN_HEADER_SIZE + ((unsigned int)points * SENSOR_BIN_SAMPLE_SIZE);
+
 	ret = snprintk(header, sizeof(header),
-		       "%sContent-Type: application/json\r\n"
-		       "Cache-Control: no-store\r\n\r\n",
-		       RESPONSE_200);
+		       "%sContent-Type: application/octet-stream\r\n"
+		       "Cache-Control: no-store\r\n"
+		       "Content-Length: %u\r\n\r\n",
+		       RESPONSE_200, payload_len);
 	if ((ret < 0) || (ret >= sizeof(header))) {
 		return -ENOBUFS;
 	}
@@ -426,37 +376,40 @@ static int send_sensor_data_response(struct http_req *request)
 		return ret;
 	}
 
-	ret = snprintk(prefix, sizeof(prefix), "{\"count\":%u,", (unsigned int)points);
-	if ((ret < 0) || (ret >= sizeof(prefix))) {
-		return -ENOBUFS;
-	}
+	meta[0] = (uint8_t)(SENSOR_BIN_MAGIC & 0xFFU);
+	meta[1] = (uint8_t)((SENSOR_BIN_MAGIC >> 8) & 0xFFU);
+	meta[2] = (uint8_t)((SENSOR_BIN_MAGIC >> 16) & 0xFFU);
+	meta[3] = (uint8_t)((SENSOR_BIN_MAGIC >> 24) & 0xFFU);
+	meta[4] = (uint8_t)(points & 0xFFU);
+	meta[5] = (uint8_t)((points >> 8) & 0xFFU);
+	meta[6] = (uint8_t)(SENSOR_BIN_SAMPLE_SIZE & 0xFFU);
+	meta[7] = (uint8_t)((SENSOR_BIN_SAMPLE_SIZE >> 8) & 0xFFU);
 
-	ret = send_response_raw(request, prefix, ret);
+	ret = send_response_raw(request, (const char *)meta, sizeof(meta));
 	if (ret) {
 		return ret;
 	}
 
-	ret = send_sensor_series_json(request, "temperature", SENSOR_FIELD_TEMPERATURE, points, true);
-	if (ret) {
-		return ret;
+	for (size_t i = points; i > 0; i--) {
+		struct sensor_sample sample;
+		float packed[4];
+
+		if (!sensor_ringbuffer_get_latest(&sensor_data, i - 1U, &sample)) {
+			return -ENOENT;
+		}
+
+		packed[0] = (float)sample.temperature;
+		packed[1] = (float)sample.humidity;
+		packed[2] = (float)sample.pressure;
+		packed[3] = (float)sample.light;
+
+		ret = send_response_raw(request, (const char *)packed, sizeof(packed));
+		if (ret) {
+			return ret;
+		}
 	}
 
-	ret = send_sensor_series_json(request, "humidity", SENSOR_FIELD_HUMIDITY, points, true);
-	if (ret) {
-		return ret;
-	}
-
-	ret = send_sensor_series_json(request, "pressure", SENSOR_FIELD_PRESSURE, points, true);
-	if (ret) {
-		return ret;
-	}
-
-	ret = send_sensor_series_json(request, "light", SENSOR_FIELD_LIGHT, points, false);
-	if (ret) {
-		return ret;
-	}
-
-	return send_response_raw(request, "}", 1);
+	return 0;
 }
 
 /* Handle HTTP request */
@@ -478,11 +431,11 @@ static void handle_http_request(struct http_req *request)
 	}
 
 	if (request->method == HTTP_GET &&
-	    (url_matches(request, "/api/sensors") || url_matches(request, "/api/data"))) {
+	    (url_matches(request, "/api/sensors") || url_matches(request, "/api/data") ||
+	     url_matches(request, "/api/sensors.bin"))) {
 		ret = send_sensor_data_response(request);
 		if (ret) {
 			LOG_ERR("send_sensor_data_response, error: %d", ret);
-			FATAL_ERROR();
 		}
 
 		return;
@@ -521,7 +474,6 @@ static void handle_http_request(struct http_req *request)
 	ret = send_response(request, resp_ptr);
 	if (ret) {
 		LOG_ERR("send_response, error: %d", ret);
-		FATAL_ERROR();
 		return;
 	}
 }
