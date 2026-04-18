@@ -1,21 +1,18 @@
-/* 1. Najpierw tworzymy naszą własną mapę pinów */
 &pinctrl {
     my_i2c_pins: my_i2c_pins {
         group1 {
-            /* NRF_PSEL(FUNKCJA, PORT, PIN) */
-            psels = <NRF_PSEL(TWIM_SDA, 1, 10)>,  /* P1.10 staje się SDA */
-                    <NRF_PSEL(TWIM_SCL, 1, 11)>;  /* P1.11 staje się SCL */
+            psels = <NRF_PSEL(TWIM_SDA, 1, 10)>,
+                    <NRF_PSEL(TWIM_SCL, 1, 11)>;
+            bias-pull-up;
         };
     };
 };
 
-/* 2. Następnie aktywujemy I2C i mówimy mu: "użyj pinów, które zdefiniowałem wyżej" */
-&i2c20 {
+&i2c21 {
     status = "okay";
     pinctrl-0 = <&my_i2c_pins>;
     pinctrl-names = "default";
 
-    /* 3. Podpinamy BME280 tak jak wcześniej */
     bme280@76 {
         compatible = "bosch,bme280";
         reg = <0x76>;
