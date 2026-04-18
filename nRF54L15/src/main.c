@@ -3,113 +3,104 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/drivers/adc.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/drivers/adc.h>
-#include <zephyr/sys/printk.h>
-LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/uuid.h>
+#include <zephyr/bluetooth/gatt.h>
 
-#if !DT_NODE_EXISTS(DT_PATH(zephyr_user)) || \
-    !DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
-#error "Brak zdefiniowanego zephyr,user io-channels dla ADC w pliku .overlay!"
-#endif
+LOG_MODULE_REGISTER(main_app, LOG_LEVEL_INF);
 
-static const struct adc_dt_spec adc_channel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
+/* Sensory */
+const struct device *const bme280 = DEVICE_DT_GET_ANY(bosch_bme280);
+const struct device *const vl53l0x = DEVICE_DT_GET_ANY(st_vl53l0x);
+
+/* UUID Serwisu i Charakterystyki dla danych sensorów */
+static struct bt_uuid_128 sensor_svc_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345678));
+
+static struct bt_uuid_128 distance_char_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x5678, 0x1234, 0x567812345679));
+
+static uint16_t last_distance_mm = 0;
+
+/* GATT: Odczyt dystansu */
+static ssize_t read_distance(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+                             void *buf, uint16_t len, uint16_t offset)
+{
+    return bt_gatt_attr_read(conn, attr, buf, len, offset, &last_distance_mm, sizeof(last_distance_mm));
+}
+
+/* Definicja serwisu GATT */
+BT_GATT_SERVICE_DEFINE(sensor_svc,
+                       BT_GATT_PRIMARY_SERVICE(&sensor_svc_uuid),
+                       BT_GATT_CHARACTERISTIC(&distance_char_uuid.uuid,
+                                              BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+                                              BT_GATT_PERM_READ,
+                                              read_distance, NULL, &last_distance_mm), );
+
+/* Rozgłaszanie (Advertising) */
+static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA_BYTES(BT_DATA_NAME_COMPLETE, 'n', 'R', 'F', '5', '4', 'L', '1', '5'),
+};
+
+static void bt_ready(int err)
+{
+    if (err)
+    {
+        LOG_ERR("Bluetooth init failed (err %d)", err);
+        return;
+    }
+    LOG_INF("Bluetooth initialized");
+
+    /* Używamy standardowego makra dla urządzeń połączalnych */
+    err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ad, ARRAY_SIZE(ad), NULL, 0);
+
+    if (err)
+    {
+        LOG_ERR("Advertising failed to start (err %d)", err);
+        return;
+    }
+    LOG_INF("Advertising started");
+}
 
 int main(void)
 {
-    /* Pobieramy podzespoly z naszego pliku overlay */
-    const struct device *const bme280_dev = DEVICE_DT_GET_ANY(bosch_bme280);
-    const struct device *const vl53l0x_dev = DEVICE_DT_GET_ANY(st_vl53l0x);
-    static const struct adc_dt_spec adc_channel = ADC_DT_SPEC_GET(DT_PATH(zephyr_user));
-
-    if (bme280_dev == NULL || !device_is_ready(bme280_dev))
-    {
-        LOG_ERR("Blad! Nie mozna zainicjowac BME280.");
-    }
-    else
-    {
-        LOG_INF("Sukces! BME280 gotowy.");
-    }
-
-    if (vl53l0x_dev == NULL || !device_is_ready(vl53l0x_dev))
-    {
-        LOG_ERR("Blad! Nie mozna zainicjowac VL53L0X. Sprawdz piny P1.12, P1.13.");
-    }
-    else
-    {
-        LOG_INF("Sukces! VL53L0X gotowy.");
-    }
-
-    if (!adc_is_ready_dt(&adc_channel))
-    {
-        LOG_ERR("Blad! Kontroler ADC nie jest gotowy.");
-    }
-    else
-    {
-        LOG_INF("Sukces! ADC gotowe.");
-    }
-
-    LOG_INF("Rozpoczynam pomiary...\n");
-
-    struct sensor_value temp, press, humidity;
+    int err;
     struct sensor_value distance;
 
-    int err;
-    int16_t sample_buffer;
+    LOG_INF("Starting Bluetooth Sensor App on nRF54L15");
 
-    struct adc_sequence sequence = {
-        .buffer = &sample_buffer,
-        .buffer_size = sizeof(sample_buffer),
-    };
-    err = adc_channel_setup_dt(&adc_channel);
-    if (err < 0) {
-        LOG_ERR("Blad konfiguracji kanalu ADC: %d", err);
-    } else {
-        LOG_INF("Kanal ADC skonfigurowany pomyslnie.");
+    /* Inicjalizacja BT */
+    err = bt_enable(bt_ready);
+    if (err)
+    {
+        LOG_ERR("Bluetooth enable failed (err %d)", err);
+        return 0;
     }
-    adc_sequence_init_dt(&adc_channel, &sequence);
 
-    /* Nieskończona pętla odczytująca dane co 2 sekundy */
+    /* Sprawdzamy czy laser działa (nie zatrzymujemy programu jeśli nie, żeby BT działało) */
+    if (!device_is_ready(vl53l0x))
+    {
+        LOG_ERR("VL53L0X nie jest gotowy. Sprawdz polaczenia na P1.12 i P1.13");
+    }
+
     while (1)
     {
-        if (device_is_ready(bme280_dev))
+        if (device_is_ready(vl53l0x))
         {
-            /* Pobranie nowej próbki z czujnika */
-            sensor_sample_fetch(bme280_dev);
+            sensor_sample_fetch(vl53l0x);
+            sensor_channel_get(vl53l0x, SENSOR_CHAN_DISTANCE, &distance);
 
-            /* Wyciągnięcie konkretnych wartości */
-            sensor_channel_get(bme280_dev, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-            sensor_channel_get(bme280_dev, SENSOR_CHAN_PRESS, &press);
-            sensor_channel_get(bme280_dev, SENSOR_CHAN_HUMIDITY, &humidity);
+            last_distance_mm = (uint16_t)(distance.val1 * 1000 + distance.val2 / 1000);
+            LOG_INF("Distance: %d mm", last_distance_mm);
 
-            /* Wyświetlenie w terminalu (ciśnienie mnożymy x10, bo Zephyr podaje w kPa) */
-            // LOG_INF("Temperatura: %.2f C | Cisnienie: %.2f hPa | Wilgotnosc: %.2f %%",
-                    // sensor_value_to_double(&temp),
-                    // sensor_value_to_double(&press) * 10.0,
-                    // sensor_value_to_double(&humidity));
+            /* Wypychamy powiadomienie (Notify) do połączonych urządzeń */
+            bt_gatt_notify(NULL, &sensor_svc.attrs[2], &last_distance_mm, sizeof(last_distance_mm));
         }
 
-        if (device_is_ready(vl53l0x_dev))
-        {
-            sensor_sample_fetch(vl53l0x_dev);
-            sensor_channel_get(vl53l0x_dev, SENSOR_CHAN_DISTANCE, &distance);
-            // printk("x: %d\n", sensor_value_to_double(&distance));
-            // LOG_INF("Dystans VL53L0X: %.3f m", sensor_value_to_double(&distance));
-        }
-
-        err = adc_read_dt(&adc_channel, &sequence);
-        if (err == 0)
-        {
-            // LOG_INF("adc: %d", sample_buffer);
-            printk("x: %d\n",sample_buffer);
-
-        }
-        else
-        {
-            LOG_ERR("Blad pomiaru ADC: %d", err);
-        }
-
-        k_sleep(K_MSEC(100)); // Czekamy 100 ms przed kolejnym pomiarem
+        k_sleep(K_MSEC(1000));
     }
-
     return 0;
 }
