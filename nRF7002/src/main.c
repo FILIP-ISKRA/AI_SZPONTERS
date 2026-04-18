@@ -94,7 +94,7 @@ static uint8_t led_states[2];
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_405 "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-#define SENSOR_JSON_MAX_POINTS 8U
+#define SENSOR_JSON_MAX_POINTS 64U
 #define SENSOR_BIN_MAGIC 0x31534E53U /* "SNS1" (little-endian) */
 #define SENSOR_BIN_HEADER_SIZE 8U
 #define SENSOR_BIN_SAMPLE_SIZE 16U
