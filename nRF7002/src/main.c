@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -51,6 +53,22 @@
 
 LOG_MODULE_REGISTER(http_server, CONFIG_HTTP_SERVER_SAMPLE_LOG_LEVEL);
 
+#ifndef CONFIG_HTTP_SERVER_SAMPLE_PAIRED_MAX
+#define CONFIG_HTTP_SERVER_SAMPLE_PAIRED_MAX 16
+#endif
+
+#ifndef CONFIG_HTTP_SERVER_SAMPLE_CLOUD_HOST
+#define CONFIG_HTTP_SERVER_SAMPLE_CLOUD_HOST "example.com"
+#endif
+
+#ifndef CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PORT
+#define CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PORT 80
+#endif
+
+#ifndef CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PATH
+#define CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PATH "/api/temperature"
+#endif
+
 #define SERVER_PORT			CONFIG_HTTP_SERVER_SAMPLE_PORT
 #define MAX_CLIENT_QUEUE		CONFIG_HTTP_SERVER_SAMPLE_CLIENTS_MAX
 #define STACK_SIZE			CONFIG_HTTP_SERVER_SAMPLE_STACK_SIZE
@@ -91,11 +109,21 @@ struct http_req {
 /* Forward declarations */
 static void process_tcp4(void);
 static void process_tcp6(void);
+static bool is_mac_paired(const char *mac);
+static void push_temperature_sample(double temperature);
+static int forward_temperature_to_cloud(const char *mac, double temperature, int8_t rssi);
 
 /* Keep track of the current LED states. 0 = LED OFF, 1 = LED ON.
  * Index 0 corresponds to LED1, index 1 to LED2.
  */
 static uint8_t led_states[2];
+static char paired_runes[CONFIG_HTTP_SERVER_SAMPLE_PAIRED_MAX][18];
+static size_t paired_runes_count;
+static K_MUTEX_DEFINE(paired_runes_lock);
+static char cloud_host[96] = CONFIG_HTTP_SERVER_SAMPLE_CLOUD_HOST;
+static int cloud_port = CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PORT;
+static char cloud_path[128] = CONFIG_HTTP_SERVER_SAMPLE_CLOUD_PATH;
+static K_MUTEX_DEFINE(cloud_cfg_lock);
 
 /* HTTP responses for demonstration */
 #define RESPONSE_200 "HTTP/1.1 200 OK\r\n"
@@ -104,6 +132,8 @@ static uint8_t led_states[2];
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_405 "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+#define RESPONSE_LINE_200 "HTTP/1.1 200 OK\r\n"
+#define RESPONSE_LINE_400 "HTTP/1.1 400 Bad Request\r\n"
 #define SENSOR_JSON_MAX_POINTS 64U
 #define SENSOR_BIN_MAGIC 0x31534E53U /* "SNS1" (little-endian) */
 #define SENSOR_BIN_HEADER_SIZE 8U
@@ -155,8 +185,17 @@ static struct http_parser_settings parser_settings;
 struct ble_scan_result {
 	bool name_match;
 	bool company_id_match;
+	bool has_temperature;
+	double temperature;
 	char name[BT_GAP_ADV_MAX_ADV_DATA_LEN + 1];
 };
+
+static void bt_addr_to_mac_string(const bt_addr_le_t *addr, char output[18])
+{
+	snprintk(output, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
+		 addr->a.val[5], addr->a.val[4], addr->a.val[3],
+		 addr->a.val[2], addr->a.val[1], addr->a.val[0]);
+}
 
 static bool ble_name_matches(const char *name)
 {
@@ -190,6 +229,12 @@ static bool ble_ad_parse_cb(struct bt_data *data, void *user_data)
 	}
 
 	case BT_DATA_MANUFACTURER_DATA:
+		if (data->data_len >= 4U) {
+			int16_t raw_temp = (int16_t)sys_get_le16(data->data + 2U);
+
+			result->temperature = (double)raw_temp / 100.0;
+			result->has_temperature = true;
+		}
 #if defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID)
 		if (data->data_len >= 2U) {
 			uint16_t company_id = sys_get_le16(data->data);
@@ -211,21 +256,32 @@ static void ble_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_
 			     struct net_buf_simple *ad)
 {
 	struct ble_scan_result result = {0};
-	char addr_str[BT_ADDR_LE_STR_LEN];
+	char mac[18];
+	int ret;
 
 	ARG_UNUSED(adv_type);
 
 	bt_data_parse(ad, ble_ad_parse_cb, &result);
+	bt_addr_to_mac_string(addr, mac);
 
-	if (!result.name_match && !result.company_id_match) {
+	if (!is_mac_paired(mac)) {
 		return;
 	}
 
-	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	LOG_INF("BLE match addr=%s rssi=%d name=\"%s\" name_ok=%d company_ok=%d",
-		addr_str, rssi,
-		result.name[0] != '\0' ? result.name : "<unknown>",
-		result.name_match, result.company_id_match);
+	if (!result.has_temperature) {
+		LOG_WRN("Paired rune %s without temperature payload", mac);
+		return;
+	}
+
+	push_temperature_sample(result.temperature);
+
+	ret = forward_temperature_to_cloud(mac, result.temperature, rssi);
+	if (ret) {
+		LOG_ERR("Cloud forward failed for %s (%d)", mac, ret);
+		return;
+	}
+
+	LOG_INF("Forwarded temperature %.2fC from %s (rssi=%d)", result.temperature, mac, rssi);
 }
 
 static int start_ble_scan(void)
@@ -316,11 +372,205 @@ static int led_update(uint8_t index, uint8_t state)
 	return 0;
 }
 
+static size_t url_path_len(const struct http_req *request)
+{
+	for (size_t i = 0U; i < request->url_len; i++) {
+		if (request->url[i] == '?') {
+			return i;
+		}
+	}
+
+	return request->url_len;
+}
+
+static bool get_query_param(struct http_req *request,
+				    const char *name,
+				    const char **value,
+				    size_t *value_len)
+{
+	size_t path_len = url_path_len(request);
+	const char *query;
+	size_t query_len;
+	size_t name_len = strlen(name);
+
+	if (path_len >= request->url_len) {
+		return false;
+	}
+
+	query = request->url + path_len + 1U;
+	query_len = request->url_len - path_len - 1U;
+
+	for (size_t i = 0U; i < query_len;) {
+		size_t key_start = i;
+		size_t key_end = i;
+		size_t val_start;
+		size_t val_end;
+
+		while (key_end < query_len && query[key_end] != '=' && query[key_end] != '&') {
+			key_end++;
+		}
+
+		if (key_end >= query_len || query[key_end] != '=') {
+			while (key_end < query_len && query[key_end] != '&') {
+				key_end++;
+			}
+			i = (key_end < query_len) ? key_end + 1U : query_len;
+			continue;
+		}
+
+		val_start = key_end + 1U;
+		val_end = val_start;
+		while (val_end < query_len && query[val_end] != '&') {
+			val_end++;
+		}
+
+		if ((key_end - key_start) == name_len &&
+		    memcmp(query + key_start, name, name_len) == 0) {
+			*value = query + val_start;
+			*value_len = val_end - val_start;
+			return true;
+		}
+
+		i = (val_end < query_len) ? val_end + 1U : query_len;
+	}
+
+	return false;
+}
+
+static bool url_decode_component(const char *input, size_t input_len,
+					 char *output, size_t output_size)
+{
+	size_t out = 0U;
+
+	if (output_size == 0U) {
+		return false;
+	}
+
+	for (size_t i = 0U; i < input_len; i++) {
+		char ch = input[i];
+
+		if (ch == '%' && (i + 2U) < input_len) {
+			char h = input[i + 1U];
+			char l = input[i + 2U];
+			int hi;
+			int lo;
+
+			if (!isxdigit((unsigned char)h) || !isxdigit((unsigned char)l)) {
+				return false;
+			}
+
+			hi = (h <= '9') ? (h - '0') : (10 + (toupper((unsigned char)h) - 'A'));
+			lo = (l <= '9') ? (l - '0') : (10 + (toupper((unsigned char)l) - 'A'));
+
+			if ((out + 1U) >= output_size) {
+				return false;
+			}
+
+			output[out++] = (char)((hi << 4) | lo);
+			i += 2U;
+			continue;
+		}
+
+		if (ch == '+') {
+			ch = ' ';
+		}
+
+		if ((out + 1U) >= output_size) {
+			return false;
+		}
+
+		output[out++] = ch;
+	}
+
+	output[out] = '\0';
+	return true;
+}
+
+static bool normalize_mac_string(const char *input, size_t input_len, char output[18])
+{
+	if (input_len != 17U) {
+		return false;
+	}
+
+	for (size_t i = 0U; i < 17U; i++) {
+		char ch = input[i];
+
+		if ((i % 3U) == 2U) {
+			if (ch != ':' && ch != '-') {
+				return false;
+			}
+			output[i] = ':';
+			continue;
+		}
+
+		if (!isxdigit((unsigned char)ch)) {
+			return false;
+		}
+
+		output[i] = (char)toupper((unsigned char)ch);
+	}
+
+	output[17] = '\0';
+	return true;
+}
+
+static bool is_mac_paired(const char *mac)
+{
+	bool found = false;
+
+	k_mutex_lock(&paired_runes_lock, K_FOREVER);
+	for (size_t i = 0U; i < paired_runes_count; i++) {
+		if (strcmp(paired_runes[i], mac) == 0) {
+			found = true;
+			break;
+		}
+	}
+	k_mutex_unlock(&paired_runes_lock);
+
+	return found;
+}
+
+static int add_paired_mac(const char *mac)
+{
+	int ret = -ENOMEM;
+
+	k_mutex_lock(&paired_runes_lock, K_FOREVER);
+	for (size_t i = 0U; i < paired_runes_count; i++) {
+		if (strcmp(paired_runes[i], mac) == 0) {
+			ret = 0;
+			goto out;
+		}
+	}
+
+	if (paired_runes_count < ARRAY_SIZE(paired_runes)) {
+		strncpy(paired_runes[paired_runes_count], mac, sizeof(paired_runes[0]) - 1U);
+		paired_runes[paired_runes_count][sizeof(paired_runes[0]) - 1U] = '\0';
+		paired_runes_count++;
+		ret = 0;
+	}
+
+out:
+	k_mutex_unlock(&paired_runes_lock);
+	return ret;
+}
+
+static size_t get_paired_count(void)
+{
+	size_t count;
+
+	k_mutex_lock(&paired_runes_lock, K_FOREVER);
+	count = paired_runes_count;
+	k_mutex_unlock(&paired_runes_lock);
+
+	return count;
+}
+
 static bool url_matches(struct http_req *request, const char *path)
 {
 	size_t path_len = strlen(path);
+	size_t req_path_len = url_path_len(request);
 
-	if (request->url_len != path_len) {
+	if (req_path_len != path_len) {
 		return false;
 	}
 
@@ -329,7 +579,7 @@ static bool url_matches(struct http_req *request, const char *path)
 
 static int get_led_id_from_url(struct http_req *request, uint8_t *led_id)
 {
-	if (request->url_len != 6) {
+	if (url_path_len(request) != 6U) {
 		return -EINVAL;
 	}
 
@@ -448,6 +698,298 @@ static int send_response_raw(struct http_req *request, const char *response, siz
 static int send_response(struct http_req *request, char *response)
 {
 	return send_response_raw(request, response, strlen(response));
+}
+
+static int send_json_response(struct http_req *request,
+			      const char *status_line,
+			      const char *json)
+{
+	int ret;
+	char header[192];
+
+	ret = snprintk(header, sizeof(header),
+		       "%s"
+		       "Content-Type: application/json; charset=utf-8\r\n"
+		       "Cache-Control: no-store\r\n"
+		       "Content-Length: %u\r\n\r\n",
+		       status_line,
+		       (unsigned int)strlen(json));
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, header, (size_t)ret);
+	if (ret) {
+		return ret;
+	}
+
+	return send_response_raw(request, json, strlen(json));
+}
+
+static void push_temperature_sample(double temperature)
+{
+	struct sensor_sample latest = {
+		.temperature = temperature,
+		.humidity = 0.0,
+		.pressure = 0.0,
+		.light = 0.0,
+	};
+
+	if (sensor_ringbuffer_get_latest(&sensor_data, 0U, &latest)) {
+		latest.temperature = temperature;
+	}
+
+	sensor_ringbuffer_push(&sensor_data, latest);
+}
+
+static int socket_send_all(int socket_fd, const char *data, size_t data_len)
+{
+	size_t sent = 0U;
+
+	while (sent < data_len) {
+		ssize_t out_len = send(socket_fd, data + sent, data_len - sent, 0);
+
+		if (out_len < 0) {
+			return -errno;
+		}
+
+		if (out_len == 0) {
+			return -ECONNRESET;
+		}
+
+		sent += (size_t)out_len;
+	}
+
+	return 0;
+}
+
+static int connect_cloud_socket(char *host_out, size_t host_out_len,
+				int *port_out, char *path_out, size_t path_out_len)
+{
+	struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+		.ai_protocol = IPPROTO_TCP,
+	};
+	struct addrinfo *res = NULL;
+	struct addrinfo *rp;
+	char service[8];
+	int sock = -1;
+	int ret;
+
+	k_mutex_lock(&cloud_cfg_lock, K_FOREVER);
+	strncpy(host_out, cloud_host, host_out_len - 1U);
+	host_out[host_out_len - 1U] = '\0';
+	strncpy(path_out, cloud_path, path_out_len - 1U);
+	path_out[path_out_len - 1U] = '\0';
+	*port_out = cloud_port;
+	k_mutex_unlock(&cloud_cfg_lock);
+
+	if ((*port_out <= 0) || (*port_out > 65535)) {
+		return -EINVAL;
+	}
+
+	ret = snprintk(service, sizeof(service), "%d", *port_out);
+	if ((ret < 0) || (ret >= sizeof(service))) {
+		return -EINVAL;
+	}
+
+	ret = getaddrinfo(host_out, service, &hints, &res);
+	if (ret != 0 || res == NULL) {
+		LOG_ERR("Cloud DNS resolve failed for %s:%s (%d)", host_out, service, ret);
+		return -EHOSTUNREACH;
+	}
+
+	for (rp = res; rp != NULL; rp = rp->ai_next) {
+		sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+		if (sock < 0) {
+			continue;
+		}
+
+		if (connect(sock, rp->ai_addr, rp->ai_addrlen) == 0) {
+			break;
+		}
+
+		close(sock);
+		sock = -1;
+	}
+
+	freeaddrinfo(res);
+
+	if (sock < 0) {
+		LOG_ERR("Cloud connect failed %s:%d", host_out, *port_out);
+		return -ECONNREFUSED;
+	}
+
+	return sock;
+}
+
+static int forward_temperature_to_cloud(const char *mac, double temperature, int8_t rssi)
+{
+	char host[96];
+	char path[128];
+	char body[192];
+	char request[512];
+	char response_buf[96];
+	int port;
+	int sock;
+	int ret;
+
+	sock = connect_cloud_socket(host, sizeof(host), &port, path, sizeof(path));
+	if (sock < 0) {
+		return sock;
+	}
+
+	ret = snprintk(body, sizeof(body),
+		       "{\"mac\":\"%s\",\"temperature\":%.2f,\"rssi\":%d}",
+		       mac, temperature, rssi);
+	if ((ret < 0) || (ret >= sizeof(body))) {
+		close(sock);
+		return -ENOBUFS;
+	}
+
+	ret = snprintk(request, sizeof(request),
+		       "POST %s HTTP/1.1\r\n"
+		       "Host: %s\r\n"
+		       "Content-Type: application/json\r\n"
+		       "Connection: close\r\n"
+		       "Content-Length: %d\r\n\r\n"
+		       "%s",
+		       path, host, strlen(body), body);
+	if ((ret < 0) || (ret >= sizeof(request))) {
+		close(sock);
+		return -ENOBUFS;
+	}
+
+	ret = socket_send_all(sock, request, (size_t)ret);
+	if (ret) {
+		close(sock);
+		return ret;
+	}
+
+	while (recv(sock, response_buf, sizeof(response_buf), 0) > 0) {
+		/* Drain response. */
+	}
+
+	close(sock);
+	return 0;
+}
+
+static int handle_pair_request(struct http_req *request)
+{
+	const char *mac_param;
+	size_t mac_param_len;
+	char decoded_mac[32];
+	char normalized_mac[18];
+	char response[160];
+	int ret;
+
+	if (!get_query_param(request, "mac", &mac_param, &mac_param_len)) {
+		return send_json_response(request, RESPONSE_LINE_400,
+			"{\"ok\":false,\"error\":\"missing_query_mac\"}");
+	}
+
+	if (!url_decode_component(mac_param, mac_param_len, decoded_mac, sizeof(decoded_mac)) ||
+	    !normalize_mac_string(decoded_mac, strlen(decoded_mac), normalized_mac)) {
+		return send_json_response(request, RESPONSE_LINE_400,
+			"{\"ok\":false,\"error\":\"invalid_mac_format\"}");
+	}
+
+	ret = add_paired_mac(normalized_mac);
+	if (ret) {
+		return send_json_response(request, RESPONSE_LINE_400,
+			"{\"ok\":false,\"error\":\"pairing_memory_full\"}");
+	}
+
+	ret = snprintk(response, sizeof(response),
+		       "{\"ok\":true,\"paired\":\"%s\",\"paired_count\":%u}",
+		       normalized_mac,
+		       (unsigned int)get_paired_count());
+	if ((ret < 0) || (ret >= sizeof(response))) {
+		return -ENOBUFS;
+	}
+
+	LOG_INF("Paired rune: %s", normalized_mac);
+	return send_json_response(request, RESPONSE_LINE_200, response);
+}
+
+static int handle_cloud_config_request(struct http_req *request)
+{
+	const char *host_param;
+	const char *port_param;
+	const char *path_param;
+	size_t host_len;
+	size_t port_len;
+	size_t path_len;
+	char host_buf[96];
+	char port_buf[8];
+	char path_buf[128];
+	char response[256];
+	bool host_present;
+	bool port_present;
+	bool path_present;
+
+	host_present = get_query_param(request, "host", &host_param, &host_len);
+	port_present = get_query_param(request, "port", &port_param, &port_len);
+	path_present = get_query_param(request, "path", &path_param, &path_len);
+
+	if (host_present) {
+		if (!url_decode_component(host_param, host_len, host_buf, sizeof(host_buf)) ||
+		    host_buf[0] == '\0') {
+			return send_json_response(request, RESPONSE_LINE_400,
+				"{\"ok\":false,\"error\":\"invalid_host\"}");
+		}
+	}
+
+	if (path_present) {
+		if (!url_decode_component(path_param, path_len, path_buf, sizeof(path_buf)) ||
+		    path_buf[0] != '/') {
+			return send_json_response(request, RESPONSE_LINE_400,
+				"{\"ok\":false,\"error\":\"invalid_path\"}");
+		}
+	}
+
+	if (port_present) {
+		char *endptr;
+		long parsed;
+
+		if (!url_decode_component(port_param, port_len, port_buf, sizeof(port_buf))) {
+			return send_json_response(request, RESPONSE_LINE_400,
+				"{\"ok\":false,\"error\":\"invalid_port\"}");
+		}
+
+		parsed = strtol(port_buf, &endptr, 10);
+		if (endptr == port_buf || *endptr != '\0' || parsed < 1L || parsed > 65535L) {
+			return send_json_response(request, RESPONSE_LINE_400,
+				"{\"ok\":false,\"error\":\"invalid_port\"}");
+		}
+
+		k_mutex_lock(&cloud_cfg_lock, K_FOREVER);
+		cloud_port = (int)parsed;
+		k_mutex_unlock(&cloud_cfg_lock);
+	}
+
+	if (host_present) {
+		k_mutex_lock(&cloud_cfg_lock, K_FOREVER);
+		strncpy(cloud_host, host_buf, sizeof(cloud_host) - 1U);
+		cloud_host[sizeof(cloud_host) - 1U] = '\0';
+		k_mutex_unlock(&cloud_cfg_lock);
+	}
+
+	if (path_present) {
+		k_mutex_lock(&cloud_cfg_lock, K_FOREVER);
+		strncpy(cloud_path, path_buf, sizeof(cloud_path) - 1U);
+		cloud_path[sizeof(cloud_path) - 1U] = '\0';
+		k_mutex_unlock(&cloud_cfg_lock);
+	}
+
+	k_mutex_lock(&cloud_cfg_lock, K_FOREVER);
+	(void)snprintk(response, sizeof(response),
+		      "{\"ok\":true,\"host\":\"%s\",\"port\":%d,\"path\":\"%s\"}",
+		      cloud_host, cloud_port, cloud_path);
+	k_mutex_unlock(&cloud_cfg_lock);
+
+	return send_json_response(request, RESPONSE_LINE_200, response);
 }
 
 static int send_index_response(struct http_req *request)
@@ -673,6 +1215,24 @@ static void handle_http_request(struct http_req *request)
 		if (ret) {
 			LOG_ERR("send_index_response, error: %d", ret);
 			FATAL_ERROR();
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET && url_matches(request, "/api/pair")) {
+		ret = handle_pair_request(request);
+		if (ret) {
+			LOG_ERR("handle_pair_request, error: %d", ret);
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET && url_matches(request, "/api/cloud")) {
+		ret = handle_cloud_config_request(request);
+		if (ret) {
+			LOG_ERR("handle_cloud_config_request, error: %d", ret);
 		}
 
 		return;

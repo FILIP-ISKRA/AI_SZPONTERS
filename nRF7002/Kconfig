@@ -54,6 +54,33 @@ config HTTP_SERVER_SAMPLE_BLE_SCAN
 	help
 	  Enable continuous Bluetooth LE scanning in observer role.
 
+config HTTP_SERVER_SAMPLE_PAIRED_MAX
+	int "Maximum paired BLE runes in RAM"
+	default 16
+	range 1 64
+	help
+	  Maximum number of paired BLE MAC addresses kept in RAM.
+
+config HTTP_SERVER_SAMPLE_CLOUD_HOST
+	string "Cloud destination host"
+	default "example.com"
+	help
+	  Domain name (or IP) of the cloud endpoint that receives
+	  temperature events from paired runes.
+
+config HTTP_SERVER_SAMPLE_CLOUD_PORT
+	int "Cloud destination port"
+	default 80
+	range 1 65535
+	help
+	  TCP port used for forwarding temperature events.
+
+config HTTP_SERVER_SAMPLE_CLOUD_PATH
+	string "Cloud destination HTTP path"
+	default "/api/temperature"
+	help
+	  HTTP path used in POST requests sent to the cloud destination.
+
 if HTTP_SERVER_SAMPLE_BLE_SCAN
 
 config HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME
