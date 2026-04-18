@@ -7,7 +7,6 @@
 
 #include <stdio.h>
 #include <errno.h>
-#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -25,14 +24,6 @@
 
 #include <zephyr/net/http/client.h>
 #include <zephyr/net/http/parser.h>
-
-#if defined(CONFIG_BT)
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/hci.h>
-
-#include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/util.h>
-#endif
 
 #if defined(CONFIG_DK_LIBRARY)
 #include <dk_buttons_and_leds.h>
@@ -151,115 +142,6 @@ static int tcp6_sock;
 static int tcp6_accepted[MAX_CLIENT_QUEUE];
 
 static struct http_parser_settings parser_settings;
-
-#if defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_SCAN) && defined(CONFIG_BT)
-struct ble_scan_result {
-	bool name_match;
-	bool company_id_match;
-	char name[BT_GAP_ADV_MAX_ADV_DATA_LEN + 1];
-};
-
-static bool ble_name_matches(const char *name)
-{
-#if defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME)
-	const char *name_filter = CONFIG_HTTP_SERVER_SAMPLE_BLE_NAME_FILTER;
-
-	if (name_filter[0] == '\0' || name[0] == '\0') {
-		return false;
-	}
-
-	return strstr(name, name_filter) != NULL;
-#else
-	ARG_UNUSED(name);
-	return false;
-#endif
-}
-
-static bool ble_ad_parse_cb(struct bt_data *data, void *user_data)
-{
-	struct ble_scan_result *result = user_data;
-
-	switch (data->type) {
-	case BT_DATA_NAME_COMPLETE:
-	case BT_DATA_NAME_SHORTENED: {
-		size_t len = MIN(data->data_len, sizeof(result->name) - 1);
-
-		memcpy(result->name, data->data, len);
-		result->name[len] = '\0';
-		result->name_match = ble_name_matches(result->name);
-		break;
-	}
-
-	case BT_DATA_MANUFACTURER_DATA:
-#if defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID)
-		if (data->data_len >= 2U) {
-			uint16_t company_id = sys_get_le16(data->data);
-
-			result->company_id_match =
-				(company_id == (uint16_t)CONFIG_HTTP_SERVER_SAMPLE_BLE_COMPANY_ID);
-		}
-#endif
-		break;
-
-	default:
-		break;
-	}
-
-	return true;
-}
-
-static void ble_device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
-			     struct net_buf_simple *ad)
-{
-	struct ble_scan_result result = {0};
-	char addr_str[BT_ADDR_LE_STR_LEN];
-
-	ARG_UNUSED(adv_type);
-
-	bt_data_parse(ad, ble_ad_parse_cb, &result);
-
-	if (!result.name_match && !result.company_id_match) {
-		return;
-	}
-
-	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	LOG_INF("BLE match addr=%s rssi=%d name=\"%s\" name_ok=%d company_ok=%d",
-		addr_str, rssi,
-		result.name[0] != '\0' ? result.name : "<unknown>",
-		result.name_match, result.company_id_match);
-}
-
-static int start_ble_scan(void)
-{
-	int ret;
-	static const struct bt_le_scan_param scan_param = {
-		.type = BT_LE_SCAN_TYPE_ACTIVE,
-		.options = BT_LE_SCAN_OPT_NONE,
-		.interval = BT_GAP_SCAN_FAST_INTERVAL,
-		.window = BT_GAP_SCAN_FAST_WINDOW,
-	};
-
-	ret = bt_enable(NULL);
-	if (ret) {
-		LOG_ERR("Bluetooth init failed (%d)", ret);
-		return ret;
-	}
-
-	ret = bt_le_scan_start(&scan_param, ble_device_found);
-	if (ret) {
-		LOG_ERR("Bluetooth scan start failed (%d)", ret);
-		return ret;
-	}
-
-	LOG_INF("Bluetooth scan started (name filter: %s, company id: 0x%04X)",
-		IS_ENABLED(CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_NAME) ?
-		CONFIG_HTTP_SERVER_SAMPLE_BLE_NAME_FILTER : "disabled",
-		IS_ENABLED(CONFIG_HTTP_SERVER_SAMPLE_BLE_FILTER_BY_COMPANY_ID) ?
-		(uint16_t)CONFIG_HTTP_SERVER_SAMPLE_BLE_COMPANY_ID : 0U);
-
-	return 0;
-}
-#endif /* defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_SCAN) && defined(CONFIG_BT) */
 
 static void l4_event_handler(struct net_mgmt_event_callback *cb,
 			     uint64_t event,
@@ -1105,14 +987,6 @@ int main(void)
 		return ret;
 	}
 #endif /* defined(CONFIG_DK_LIBRARY) */
-
-#if defined(CONFIG_HTTP_SERVER_SAMPLE_BLE_SCAN) && defined(CONFIG_BT)
-	ret = start_ble_scan();
-	if (ret) {
-		FATAL_ERROR();
-		return ret;
-	}
-#endif
 
 	/* Setup handler for Zephyr NET Connection Manager events. */
 	net_mgmt_init_event_callback(&l4_cb, l4_event_handler, L4_EVENT_MASK);
