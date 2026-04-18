@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="pl">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1">
+	<title>Dashboard Sensorow</title>
+	<style>
+		:root {
+			--bg-1: #081722;
+			--bg-2: #0f2e46;
+			--panel: rgba(6, 20, 31, 0.78);
+			--line-1: #ff6b35;
+			--line-2: #2ec4b6;
+			--line-3: #ffd166;
+			--line-4: #90e0ef;
+			--text: #eaf3ff;
+			--muted: #aac4db;
+			--border: #2c4d66;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			min-height: 100vh;
+			padding: 20px;
+			color: var(--text);
+			font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+			background:
+				radial-gradient(900px 500px at -10% -20%, #1f4d7a 0%, transparent 70%),
+				radial-gradient(700px 450px at 110% 110%, #18445c 0%, transparent 65%),
+				linear-gradient(150deg, var(--bg-2), var(--bg-1));
+		}
+
+		.app {
+			max-width: 1200px;
+			margin: 0 auto;
+			background: var(--panel);
+			border: 1px solid var(--border);
+			border-radius: 18px;
+			padding: 18px;
+			box-shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+		}
+
+		.topbar {
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			gap: 12px;
+			flex-wrap: wrap;
+			margin-bottom: 16px;
+		}
+
+		h1 {
+			margin: 0;
+			font-size: 1.55rem;
+			letter-spacing: 0.02em;
+		}
+
+		.meta {
+			font-size: 0.9rem;
+			color: var(--muted);
+			margin-top: 4px;
+		}
+
+		.controls {
+			display: flex;
+			gap: 8px;
+			align-items: center;
+		}
+
+		button {
+			border: none;
+			border-radius: 10px;
+			padding: 10px 14px;
+			font-weight: 700;
+			cursor: pointer;
+			color: #0a1a27;
+			background: #91d9ff;
+		}
+
+		button:active {
+			transform: translateY(1px);
+		}
+
+		.grid {
+			display: grid;
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+			gap: 12px;
+		}
+
+		.card {
+			border: 1px solid var(--border);
+			border-radius: 12px;
+			padding: 10px;
+			background: rgba(8, 24, 38, 0.55);
+		}
+
+		.card-head {
+			display: flex;
+			justify-content: space-between;
+			align-items: baseline;
+			margin-bottom: 8px;
+		}
+
+		.label {
+			font-size: 0.95rem;
+			color: var(--muted);
+			font-weight: 700;
+			text-transform: uppercase;
+			letter-spacing: 0.05em;
+		}
+
+		.value {
+			font-size: 1.1rem;
+			font-weight: 700;
+		}
+
+		canvas {
+			width: 100%;
+			height: 220px;
+			display: block;
+			border-radius: 8px;
+			background: rgba(0, 0, 0, 0.2);
+		}
+
+		#status {
+			margin-top: 10px;
+			color: var(--muted);
+			font-size: 0.9rem;
+		}
+
+		@media (max-width: 820px) {
+			.grid {
+				grid-template-columns: 1fr;
+			}
+
+			canvas {
+				height: 190px;
+			}
+		}
+	</style>
+</head>
+<body>
+	<main class="app">
+		<header class="topbar">
+			<div>
+				<h1>Dashboard Sensorow</h1>
+				<div class="meta" id="meta">Ladowanie danych...</div>
+			</div>
+			<div class="controls">
+				<button id="refreshBtn">Refresh</button>
+			</div>
+		</header>
+
+		<section class="grid">
+			<article class="card">
+				<div class="card-head"><span class="label">Temperatura</span><span class="value" id="vTemp">-</span></div>
+				<canvas id="cTemp" width="520" height="220"></canvas>
+			</article>
+			<article class="card">
+				<div class="card-head"><span class="label">Wilgotnosc</span><span class="value" id="vHum">-</span></div>
+				<canvas id="cHum" width="520" height="220"></canvas>
+			</article>
+			<article class="card">
+				<div class="card-head"><span class="label">Cisnienie</span><span class="value" id="vPres">-</span></div>
+				<canvas id="cPres" width="520" height="220"></canvas>
+			</article>
+			<article class="card">
+				<div class="card-head"><span class="label">Swiatlo</span><span class="value" id="vLight">-</span></div>
+				<canvas id="cLight" width="520" height="220"></canvas>
+			</article>
+		</section>
+
+		<div id="status">Gotowe.</div>
+	</main>
+
+	<script>
+		const MAX_POINTS = 16;
+
+		const charts = [
+			{ key: "temperature", canvas: "cTemp", value: "vTemp", unit: "degC", color: "#ff6b35" },
+			{ key: "humidity", canvas: "cHum", value: "vHum", unit: "%", color: "#2ec4b6" },
+			{ key: "pressure", canvas: "cPres", value: "vPres", unit: "hPa", color: "#ffd166" },
+			{ key: "light", canvas: "cLight", value: "vLight", unit: "lx", color: "#90e0ef" },
+		];
+
+		function fmt(v) {
+			return Number(v).toFixed(2);
+		}
+
+		function drawSeries(canvasId, values, color) {
+			const canvas = document.getElementById(canvasId);
+			const ctx = canvas.getContext("2d");
+			const w = canvas.width;
+			const h = canvas.height;
+			const p = 24;
+
+			ctx.clearRect(0, 0, w, h);
+			ctx.fillStyle = "rgba(5,12,19,0.58)";
+			ctx.fillRect(0, 0, w, h);
+
+			ctx.strokeStyle = "rgba(255,255,255,0.12)";
+			ctx.lineWidth = 1;
+			for (let i = 0; i < 5; i += 1) {
+				const y = p + ((h - 2 * p) / 4) * i;
+				ctx.beginPath();
+				ctx.moveTo(p, y);
+				ctx.lineTo(w - p, y);
+				ctx.stroke();
+			}
+
+			if (!values || values.length === 0) {
+				ctx.fillStyle = "#aac4db";
+				ctx.font = "15px Trebuchet MS";
+				ctx.fillText("Brak danych", p, h / 2);
+				return;
+			}
+
+			let min = Math.min(...values);
+			let max = Math.max(...values);
+			if (min === max) {
+				min -= 1;
+				max += 1;
+			}
+
+			const plotW = w - 2 * p;
+			const plotH = h - 2 * p;
+
+			ctx.beginPath();
+			for (let i = 0; i < values.length; i += 1) {
+				const x = p + (plotW * i) / Math.max(values.length - 1, 1);
+				const y = p + ((max - values[i]) / (max - min)) * plotH;
+				if (i === 0) {
+					ctx.moveTo(x, y);
+				} else {
+					ctx.lineTo(x, y);
+				}
+			}
+
+			ctx.strokeStyle = color;
+			ctx.lineWidth = 2.2;
+			ctx.stroke();
+
+			ctx.fillStyle = "rgba(255,255,255,0.72)";
+			ctx.font = "12px Trebuchet MS";
+			ctx.fillText("min: " + fmt(min), p, 14);
+			ctx.fillText("max: " + fmt(max), w - 84, 14);
+		}
+
+		function updateValues(data) {
+			charts.forEach((cfg) => {
+				const raw = data[cfg.key] || [];
+				const arr = raw.slice(-MAX_POINTS);
+				const latest = arr.length ? arr[arr.length - 1] : null;
+				document.getElementById(cfg.value).textContent =
+					latest === null ? "-" : (fmt(latest) + " " + cfg.unit);
+				drawSeries(cfg.canvas, arr, cfg.color);
+			});
+		}
+
+		async function refreshData() {
+			const status = document.getElementById("status");
+			const meta = document.getElementById("meta");
+			status.textContent = "Odswiezanie...";
+
+			try {
+				const res = await fetch("/api/sensors", { cache: "no-store" });
+				if (!res.ok) {
+					throw new Error("HTTP " + res.status);
+				}
+
+				const data = await res.json();
+				updateValues(data);
+				meta.textContent = "Probki: " + (data.count || 0);
+				status.textContent = "OK";
+			} catch (err) {
+				status.textContent = "Blad odczytu: " + err.message;
+			}
+		}
+
+		document.getElementById("refreshBtn").addEventListener("click", refreshData);
+		refreshData();
+	</script>
+</body>
+</html>

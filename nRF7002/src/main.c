@@ -37,6 +37,7 @@
 #endif
 
 #include "credentials_provision.h"
+#include "data.h"
 
 LOG_MODULE_REGISTER(http_server, CONFIG_HTTP_SERVER_SAMPLE_LOG_LEVEL);
 
@@ -93,6 +94,20 @@ static uint8_t led_states[2];
 #define RESPONSE_404 "HTTP/1.1 404 Not Found\r\n\r\n"
 #define RESPONSE_405 "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
 #define RESPONSE_500 "HTTP/1.1 500 Internal Server Error\r\n\r\n"
+#define SENSOR_JSON_MAX_POINTS 16U
+
+static const unsigned char index_html[] = {
+#if defined(HTTP_SERVER_INDEX_HTML_INC)
+#include HTTP_SERVER_INDEX_HTML_INC
+
+	/* Null terminate page */
+	(0x00)
+#else
+""
+#endif
+};
+
+#define INDEX_HTML_LEN (sizeof(index_html) - 1)
 
 /* Processing threads for incoming connections */
 K_THREAD_STACK_ARRAY_DEFINE(tcp4_handler_stack, MAX_CLIENT_QUEUE, STACK_SIZE);
@@ -175,6 +190,40 @@ static int led_update(uint8_t index, uint8_t state)
 	return 0;
 }
 
+static bool url_matches(struct http_req *request, const char *path)
+{
+	size_t path_len = strlen(path);
+
+	if (request->url_len != path_len) {
+		return false;
+	}
+
+	return (memcmp(request->url, path, path_len) == 0);
+}
+
+static int get_led_id_from_url(struct http_req *request, uint8_t *led_id)
+{
+	if (request->url_len != 6) {
+		return -EINVAL;
+	}
+
+	if (memcmp(request->url, "/led/", 5) != 0) {
+		return -EINVAL;
+	}
+
+	if (request->url[5] < '0' || request->url[5] > '9') {
+		return -EINVAL;
+	}
+
+	*led_id = request->url[5] - '0';
+
+	if (*led_id < 1 || *led_id > 2) {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int handle_put(struct http_req *request, char *response, size_t response_size)
 {
 	int ret;
@@ -185,16 +234,9 @@ static int handle_put(struct http_req *request, char *response, size_t response_
 		return -EBADMSG;
 	}
 
-	/* Get LED ID */
-	ret = sscanf(request->url, "/led/%hhu", &led_id);
-	if (ret != 1) {
-		LOG_WRN("Invalid URL: %s", request->url);
-		return -EINVAL;
-	}
-
-	/* Get LED Index */
-	if (led_id < 1 || led_id > 2) {
-		LOG_ERR("Invalid LED ID: %d, valid values are 1 and 2", led_id);
+	ret = get_led_id_from_url(request, &led_id);
+	if (ret) {
+		LOG_WRN("Invalid URL for PUT");
 		return -EINVAL;
 	}
 
@@ -221,16 +263,9 @@ static int handle_get(struct http_req *request, char *response, size_t response_
 	char body[2];
 	uint8_t led_id, led_index;
 
-	/* Get LED ID */
-	ret = sscanf(request->url, "/led/%hhu", &led_id);
-	if (ret != 1) {
-		LOG_WRN("Invalid URL: %s", request->url);
-		return -EINVAL;
-	}
-
-	/* Get LED Index */
-	if (led_id < 1 || led_id > 2) {
-		LOG_ERR("Invalid LED ID: %d, valid values are 1 and 2", led_id);
+	ret = get_led_id_from_url(request, &led_id);
+	if (ret) {
+		LOG_WRN("Invalid URL for GET");
 		return -EINVAL;
 	}
 
@@ -242,7 +277,7 @@ static int handle_get(struct http_req *request, char *response, size_t response_
 	}
 
 	ret = snprintk(response, response_size,
-		       "%sContent-Type: text/plain\r\n\r\nContent-Length: %d\r\n\r\n%s",
+		       "%sContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s",
 		       RESPONSE_200, strlen(body), body);
 	if ((ret < 0) || (ret >= response_size)) {
 		return -ENOBUFS;
@@ -251,22 +286,177 @@ static int handle_get(struct http_req *request, char *response, size_t response_
 	return 0;
 }
 
-static int send_response(struct http_req *request, char *response)
+static int send_response_raw(struct http_req *request, const char *response, size_t len)
 {
 	ssize_t out_len;
-	size_t len = strlen(response);
+	size_t sent = 0;
 
-	while (len) {
-		out_len = send(request->socket, response, len, 0);
+	while (sent < len) {
+		out_len = send(request->socket, response + sent, len - sent, 0);
 		if (out_len < 0) {
 			LOG_ERR("send, error: %d", -errno);
 			return -errno;
 		}
 
-		len -= out_len;
+		sent += out_len;
 	}
 
 	return 0;
+}
+
+static int send_response(struct http_req *request, char *response)
+{
+	return send_response_raw(request, response, strlen(response));
+}
+
+static int send_index_response(struct http_req *request)
+{
+	int ret;
+	char header[96];
+
+	ret = snprintk(header, sizeof(header),
+		       "%sContent-Type: text/html; charset=utf-8\r\n"
+		       "Content-Length: %u\r\n\r\n",
+		       RESPONSE_200, (unsigned int)INDEX_HTML_LEN);
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, header, ret);
+	if (ret) {
+		return ret;
+	}
+
+	return send_response_raw(request, (const char *)index_html, INDEX_HTML_LEN);
+}
+
+enum sensor_field {
+	SENSOR_FIELD_TEMPERATURE,
+	SENSOR_FIELD_HUMIDITY,
+	SENSOR_FIELD_PRESSURE,
+	SENSOR_FIELD_LIGHT,
+};
+
+static double sensor_field_value(const struct sensor_sample *sample, enum sensor_field field)
+{
+	switch (field) {
+	case SENSOR_FIELD_TEMPERATURE:
+		return sample->temperature;
+	case SENSOR_FIELD_HUMIDITY:
+		return sample->humidity;
+	case SENSOR_FIELD_PRESSURE:
+		return sample->pressure;
+	case SENSOR_FIELD_LIGHT:
+		return sample->light;
+	default:
+		return 0.0;
+	}
+}
+
+static int send_sensor_series_json(struct http_req *request,
+				   const char *name,
+				   enum sensor_field field,
+				   size_t points,
+				   bool trailing_comma)
+{
+	int ret;
+	char chunk[96];
+
+	ret = snprintk(chunk, sizeof(chunk), "\"%s\":[", name);
+	if ((ret < 0) || (ret >= sizeof(chunk))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, chunk, ret);
+	if (ret) {
+		return ret;
+	}
+
+	for (size_t i = points; i > 0; i--) {
+		struct sensor_sample sample;
+		double value;
+
+		if (!sensor_ringbuffer_get_latest(&sensor_data, i - 1U, &sample)) {
+			return -ENOENT;
+		}
+
+		value = sensor_field_value(&sample, field);
+
+		ret = snprintk(chunk, sizeof(chunk), (i == points) ? "%.2f" : ",%.2f", value);
+		if ((ret < 0) || (ret >= sizeof(chunk))) {
+			return -ENOBUFS;
+		}
+
+		ret = send_response_raw(request, chunk, ret);
+		if (ret) {
+			return ret;
+		}
+	}
+
+	if (trailing_comma) {
+		ret = send_response_raw(request, "],", 2);
+	} else {
+		ret = send_response_raw(request, "]", 1);
+	}
+
+	return ret;
+}
+
+static int send_sensor_data_response(struct http_req *request)
+{
+	int ret;
+	char header[144];
+	char prefix[64];
+	size_t points = sensor_ringbuffer_size(&sensor_data);
+
+	if (points > SENSOR_JSON_MAX_POINTS) {
+		points = SENSOR_JSON_MAX_POINTS;
+	}
+
+	ret = snprintk(header, sizeof(header),
+		       "%sContent-Type: application/json\r\n"
+		       "Cache-Control: no-store\r\n\r\n",
+		       RESPONSE_200);
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, header, ret);
+	if (ret) {
+		return ret;
+	}
+
+	ret = snprintk(prefix, sizeof(prefix), "{\"count\":%u,", (unsigned int)points);
+	if ((ret < 0) || (ret >= sizeof(prefix))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, prefix, ret);
+	if (ret) {
+		return ret;
+	}
+
+	ret = send_sensor_series_json(request, "temperature", SENSOR_FIELD_TEMPERATURE, points, true);
+	if (ret) {
+		return ret;
+	}
+
+	ret = send_sensor_series_json(request, "humidity", SENSOR_FIELD_HUMIDITY, points, true);
+	if (ret) {
+		return ret;
+	}
+
+	ret = send_sensor_series_json(request, "pressure", SENSOR_FIELD_PRESSURE, points, true);
+	if (ret) {
+		return ret;
+	}
+
+	ret = send_sensor_series_json(request, "light", SENSOR_FIELD_LIGHT, points, false);
+	if (ret) {
+		return ret;
+	}
+
+	return send_response_raw(request, "}", 1);
 }
 
 /* Handle HTTP request */
@@ -274,7 +464,29 @@ static void handle_http_request(struct http_req *request)
 {
 	int ret;
 	char *resp_ptr = RESPONSE_200;
-	char get_response_buffer[100] = { 0 };
+	char get_response_buffer[128] = { 0 };
+
+	if (request->method == HTTP_GET &&
+	    (url_matches(request, "/") || url_matches(request, "/index.html"))) {
+		ret = send_index_response(request);
+		if (ret) {
+			LOG_ERR("send_index_response, error: %d", ret);
+			FATAL_ERROR();
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET &&
+	    (url_matches(request, "/api/sensors") || url_matches(request, "/api/data"))) {
+		ret = send_sensor_data_response(request);
+		if (ret) {
+			LOG_ERR("send_sensor_data_response, error: %d", ret);
+			FATAL_ERROR();
+		}
+
+		return;
+	}
 
 	/* Handle the request method */
 	switch (request->method) {
