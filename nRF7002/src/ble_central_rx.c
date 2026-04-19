@@ -16,10 +16,9 @@
 
 #include "ble_central_rx.h"
 #include "data.h"
+#include "paired_devices.h"
 
 LOG_MODULE_REGISTER(ble_central_rx, LOG_LEVEL_INF);
-
-#define PEER_DEVICE_NAME "nRF54L15"
 
 enum sensor_uuid_idx {
 	SENSOR_IDX_DISTANCE,
@@ -316,21 +315,6 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 	return BT_GATT_ITER_CONTINUE;
 }
 
-static bool ad_parse(struct bt_data *data, void *user_data)
-{
-	bool *found = user_data;
-
-	if (data->type == BT_DATA_NAME_COMPLETE || data->type == BT_DATA_NAME_SHORTENED) {
-		if (data->data_len == strlen(PEER_DEVICE_NAME) &&
-		    memcmp(data->data, PEER_DEVICE_NAME, data->data_len) == 0) {
-			*found = true;
-			return false;
-		}
-	}
-
-	return true;
-}
-
 static void start_scan(void)
 {
 	int err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, device_found);
@@ -340,7 +324,7 @@ static void start_scan(void)
 		return;
 	}
 
-	LOG_INF("Scanning for peer %s...", PEER_DEVICE_NAME);
+	LOG_INF("Scanning for paired BLE devices...");
 }
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
@@ -348,7 +332,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 {
 	char addr_str[BT_ADDR_LE_STR_LEN];
 	int err;
-	bool found = false;
+
+	ARG_UNUSED(ad);
 
 	if (default_conn) {
 		return;
@@ -359,14 +344,14 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		return;
 	}
 
-	bt_data_parse(ad, ad_parse, &found);
-
-	if (!found) {
+	if (!paired_devices_is_paired_addr(addr)) {
+		bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+		LOG_DBG("Ignoring unpaired advertiser %s", addr_str);
 		return;
 	}
 
 	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	LOG_INF("Found peer %s (%s), RSSI %d", PEER_DEVICE_NAME, addr_str, rssi);
+	LOG_INF("Found paired advertiser %s, RSSI %d", addr_str, rssi);
 
 	(void)bt_le_scan_stop();
 

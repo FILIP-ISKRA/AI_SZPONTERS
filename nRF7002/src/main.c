@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <errno.h>
+#include <string.h>
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -40,6 +41,7 @@
 #include "ble_central_rx.h"
 #include "data.h"
 #include "node_socket_client.h"
+#include "paired_devices.h"
 #include "predictor.h"
 
 LOG_MODULE_REGISTER(http_server, CONFIG_HTTP_SERVER_SAMPLE_LOG_LEVEL);
@@ -84,6 +86,7 @@ struct http_req {
 /* Forward declarations */
 static void process_tcp4(void);
 static void process_tcp6(void);
+static int send_response_raw(struct http_req *request, const char *response, size_t len);
 
 /* Keep track of the current LED states. 0 = LED OFF, 1 = LED ON.
  * Index 0 corresponds to LED1, index 1 to LED2.
@@ -105,6 +108,17 @@ static uint8_t led_states[2];
 #define PRED_BIN_HEADER_SIZE 12U
 #define PRED_BIN_SAMPLE_SIZE SENSOR_BIN_SAMPLE_SIZE
 #define PREDICTION_STEPS_AHEAD 6U
+#define PAIR_MAC_MAX_LEN 18U
+#define PAIR_SENSORS_MAX_LEN 128U
+
+struct pairing_state {
+	bool pending;
+	bool confirmed;
+	char mac[PAIR_MAC_MAX_LEN];
+	char sensors[PAIR_SENSORS_MAX_LEN];
+};
+
+static struct pairing_state current_pairing;
 
 static const unsigned char index_html[] = {
 #if defined(HTTP_SERVER_INDEX_HTML_INC)
@@ -117,7 +131,19 @@ static const unsigned char index_html[] = {
 #endif
 };
 
+static const unsigned char pairing_html[] = {
+#if defined(HTTP_SERVER_PAIRING_HTML_INC)
+#include HTTP_SERVER_PAIRING_HTML_INC
+
+	/* Null terminate page */
+	(0x00)
+#else
+""
+#endif
+};
+
 #define INDEX_HTML_LEN (sizeof(index_html) - 1)
+#define PAIRING_HTML_LEN (sizeof(pairing_html) - 1)
 
 /* Processing threads for incoming connections */
 K_THREAD_STACK_ARRAY_DEFINE(tcp4_handler_stack, MAX_CLIENT_QUEUE, STACK_SIZE);
@@ -209,6 +235,220 @@ static bool url_matches(struct http_req *request, const char *path)
 	}
 
 	return (memcmp(request->url, path, path_len) == 0);
+}
+
+static bool url_path_matches(struct http_req *request, const char *path)
+{
+	size_t path_len = strlen(path);
+
+	if (request->url_len < path_len) {
+		return false;
+	}
+
+	if (memcmp(request->url, path, path_len) != 0) {
+		return false;
+	}
+
+	if (request->url_len == path_len) {
+		return true;
+	}
+
+	return request->url[path_len] == '?';
+}
+
+static bool is_hex_digit_char(char value)
+{
+	return ((value >= '0' && value <= '9') ||
+		(value >= 'a' && value <= 'f') ||
+		(value >= 'A' && value <= 'F'));
+}
+
+static bool validate_mac_address(const char *mac)
+{
+	if (strlen(mac) != 17U) {
+		return false;
+	}
+
+	for (size_t i = 0U; i < 17U; i++) {
+		if (((i + 1U) % 3U) == 0U) {
+			if (mac[i] != ':') {
+				return false;
+			}
+		} else if (!is_hex_digit_char(mac[i])) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static bool validate_sensors_csv(const char *sensors)
+{
+	size_t sensors_len = strlen(sensors);
+
+	if (sensors_len == 0U || sensors_len >= PAIR_SENSORS_MAX_LEN) {
+		return false;
+	}
+
+	for (size_t i = 0U; i < sensors_len; i++) {
+		char value = sensors[i];
+
+		if ((value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
+		    (value >= '0' && value <= '9') || value == ',' || value == '_' || value == '-') {
+			continue;
+		}
+
+		return false;
+	}
+
+	return true;
+}
+
+static bool query_get_value(struct http_req *request,
+				    const char *key,
+				    char *out,
+				    size_t out_size)
+{
+	const char *query = memchr(request->url, '?', request->url_len);
+	size_t key_len = strlen(key);
+	size_t prefix_len;
+	const char *cursor;
+	const char *url_end = request->url + request->url_len;
+
+	if (query == NULL || out_size == 0U) {
+		return false;
+	}
+
+	prefix_len = key_len + 1U;
+	cursor = query + 1;
+
+	while (cursor < url_end) {
+		const char *part_end = memchr(cursor, '&', (size_t)(url_end - cursor));
+		const char *value_start;
+		size_t value_len;
+
+		if (part_end == NULL) {
+			part_end = url_end;
+		}
+
+		if ((size_t)(part_end - cursor) > prefix_len &&
+		    memcmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
+			value_start = cursor + prefix_len;
+			value_len = (size_t)(part_end - value_start);
+
+			if (value_len >= out_size) {
+				return false;
+			}
+
+			memcpy(out, value_start, value_len);
+			out[value_len] = '\0';
+			return true;
+		}
+
+		cursor = (part_end < url_end) ? (part_end + 1) : url_end;
+	}
+
+	return false;
+}
+
+static int send_pairing_state_response(struct http_req *request)
+{
+	int ret;
+	char header[192];
+	char body[512];
+
+	ret = snprintk(body, sizeof(body),
+			      "{\"pending\":%s,\"confirmed\":%s,\"mac\":\"%.*s\",\"sensors\":\"%.*s\"}",
+			      current_pairing.pending ? "true" : "false",
+			      current_pairing.confirmed ? "true" : "false",
+			      (int)(PAIR_MAC_MAX_LEN - 1U), current_pairing.mac,
+			      (int)(PAIR_SENSORS_MAX_LEN - 1U), current_pairing.sensors);
+	if ((ret < 0) || (ret >= sizeof(body))) {
+		return -ENOBUFS;
+	}
+
+	ret = snprintk(header, sizeof(header),
+		       "HTTP/1.1 200 OK\r\n"
+		       "Content-Type: application/json\r\n"
+		       "Cache-Control: no-store\r\n"
+		       "Connection: close\r\n"
+		       "Content-Length: %d\r\n\r\n",
+		       ret);
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, header, ret);
+	if (ret) {
+		return ret;
+	}
+
+	return send_response_raw(request, body, strlen(body));
+}
+
+static int send_redirect_response(struct http_req *request, const char *location)
+{
+	int ret;
+	char header[256];
+
+	ret = snprintk(header, sizeof(header),
+		       "HTTP/1.1 303 See Other\r\n"
+		       "Location: %s\r\n"
+		       "Connection: close\r\n"
+		       "Cache-Control: no-store\r\n"
+		       "Content-Length: 0\r\n\r\n",
+		       location);
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	return send_response_raw(request, header, (size_t)ret);
+}
+
+static int handle_pairing_request(struct http_req *request)
+{
+	char mac[PAIR_MAC_MAX_LEN];
+	char sensors[PAIR_SENSORS_MAX_LEN];
+
+	if (!query_get_value(request, "mac", mac, sizeof(mac)) ||
+	    !query_get_value(request, "sensors", sensors, sizeof(sensors))) {
+		return -EINVAL;
+	}
+
+	if (!validate_mac_address(mac) || !validate_sensors_csv(sensors)) {
+		return -EINVAL;
+	}
+
+	strncpy(current_pairing.mac, mac, sizeof(current_pairing.mac) - 1U);
+	current_pairing.mac[sizeof(current_pairing.mac) - 1U] = '\0';
+
+	strncpy(current_pairing.sensors, sensors, sizeof(current_pairing.sensors) - 1U);
+	current_pairing.sensors[sizeof(current_pairing.sensors) - 1U] = '\0';
+
+	current_pairing.pending = true;
+	current_pairing.confirmed = false;
+
+	LOG_INF("Pairing request: mac=%s sensors=%s", current_pairing.mac, current_pairing.sensors);
+
+	return send_redirect_response(request, "/pairing.html");
+}
+
+static int handle_pairing_confirm(struct http_req *request)
+{
+	if (!current_pairing.pending) {
+		return -ENOENT;
+	}
+
+	if (!paired_devices_add_mac_string(current_pairing.mac)) {
+		return -ENOMEM;
+	}
+
+	current_pairing.pending = false;
+	current_pairing.confirmed = true;
+
+	LOG_INF("Pairing confirmed for %s", current_pairing.mac);
+
+	return send_pairing_state_response(request);
 }
 
 static int get_led_id_from_url(struct http_req *request, uint8_t *led_id)
@@ -353,6 +593,27 @@ static int send_index_response(struct http_req *request)
 	}
 
 	return send_response_raw(request, (const char *)index_html, INDEX_HTML_LEN);
+}
+
+static int send_pairing_page_response(struct http_req *request)
+{
+	int ret;
+	char header[96];
+
+	ret = snprintk(header, sizeof(header),
+		       "%sContent-Type: text/html; charset=utf-8\r\n"
+		       "Content-Length: %u\r\n\r\n",
+		       RESPONSE_200, (unsigned int)PAIRING_HTML_LEN);
+	if ((ret < 0) || (ret >= sizeof(header))) {
+		return -ENOBUFS;
+	}
+
+	ret = send_response_raw(request, header, ret);
+	if (ret) {
+		return ret;
+	}
+
+	return send_response_raw(request, (const char *)pairing_html, PAIRING_HTML_LEN);
 }
 
 static int send_sensor_data_response(struct http_req *request)
@@ -556,7 +817,52 @@ static void handle_http_request(struct http_req *request)
 		ret = send_index_response(request);
 		if (ret) {
 			LOG_ERR("send_index_response, error: %d", ret);
-			FATAL_ERROR();
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET &&
+	    (url_matches(request, "/pairing") || url_matches(request, "/pairing.html"))) {
+		ret = send_pairing_page_response(request);
+		if (ret) {
+			LOG_ERR("send_pairing_page_response, error: %d", ret);
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET &&
+	    (url_path_matches(request, "/api/pair") || url_path_matches(request, "/pair"))) {
+		ret = handle_pairing_request(request);
+		if (ret) {
+			if (ret == -EINVAL) {
+				resp_ptr = RESPONSE_400;
+			} else {
+				resp_ptr = RESPONSE_500;
+			}
+
+			(void)send_response(request, resp_ptr);
+		}
+
+		return;
+	}
+
+	if (request->method == HTTP_GET && url_matches(request, "/api/pairing")) {
+		ret = send_pairing_state_response(request);
+		if (ret) {
+			LOG_ERR("send_pairing_state_response, error: %d", ret);
+		}
+
+		return;
+	}
+
+	if ((request->method == HTTP_GET || request->method == HTTP_POST) &&
+	    url_matches(request, "/api/pair/confirm")) {
+		ret = handle_pairing_confirm(request);
+		if (ret) {
+			resp_ptr = (ret == -ENOENT) ? RESPONSE_404 : RESPONSE_500;
+			(void)send_response(request, resp_ptr);
 		}
 
 		return;

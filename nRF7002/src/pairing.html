@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="pl">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width,initial-scale=1">
+	<title>Heimdall Pairing</title>
+	<style>
+		:root {
+			--bg-1: #081722;
+			--bg-2: #0f2e46;
+			--panel: rgba(6, 20, 31, 0.78);
+			--text: #eaf3ff;
+			--muted: #aac4db;
+			--border: #2c4d66;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			min-height: 100vh;
+			padding: 20px;
+			color: var(--text);
+			font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+			background:
+				radial-gradient(900px 500px at -10% -20%, #1f4d7a 0%, transparent 70%),
+				radial-gradient(700px 450px at 110% 110%, #18445c 0%, transparent 65%),
+				linear-gradient(150deg, var(--bg-2), var(--bg-1));
+		}
+
+		.app {
+			max-width: 840px;
+			margin: 0 auto;
+			background: var(--panel);
+			border: 1px solid var(--border);
+			border-radius: 18px;
+			padding: 18px;
+			box-shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+		}
+
+		h1 {
+			margin: 0;
+			font-size: 1.45rem;
+			letter-spacing: 0.02em;
+		}
+
+		.meta {
+			font-size: 0.9rem;
+			color: var(--muted);
+			margin: 6px 0 10px;
+		}
+
+		.actions {
+			display: flex;
+			gap: 8px;
+			flex-wrap: wrap;
+			margin-bottom: 10px;
+		}
+
+		button,
+		a.btn {
+			display: inline-block;
+			text-decoration: none;
+			border: none;
+			border-radius: 10px;
+			padding: 10px 14px;
+			font-weight: 700;
+			cursor: pointer;
+			color: #0a1a27;
+			background: #91d9ff;
+		}
+
+		.panel {
+			margin-top: 8px;
+			border: 1px solid var(--border);
+			border-radius: 12px;
+			padding: 12px;
+			background: rgba(8, 24, 38, 0.55);
+		}
+
+		.row {
+			color: var(--muted);
+			font-size: 0.95rem;
+			margin-bottom: 8px;
+		}
+
+		.sensor-list {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin: 8px 0 10px 0;
+		}
+
+		.sensor-tag {
+			padding: 4px 8px;
+			border-radius: 999px;
+			background: rgba(145, 217, 255, 0.18);
+			border: 1px solid var(--border);
+			font-size: 0.82rem;
+		}
+
+		#status {
+			margin-top: 10px;
+			color: var(--muted);
+			font-size: 0.9rem;
+		}
+	</style>
+</head>
+<body>
+	<main class="app">
+		<h1>Parowanie urzadzenia</h1>
+		<div class="meta">Strona parowania dla `heimdall.local`</div>
+
+		<div class="actions">
+			<a class="btn" href="/index.html">Wroc do dashboardu</a>
+			<button id="refreshPairBtn">Odswiez pairing</button>
+		</div>
+
+		<section class="panel">
+			<div class="row" id="pairingState">Brak oczekujacego zadania parowania.</div>
+			<div class="row" id="pairingMac">MAC: -</div>
+			<div class="sensor-list" id="pairingSensors"></div>
+			<button id="confirmPairBtn" disabled>Potwierdz dodanie urzadzenia</button>
+		</section>
+
+		<div id="status">Gotowe.</div>
+	</main>
+
+	<script>
+		function parseSensorsCsv(csv) {
+			if (!csv) {
+				return [];
+			}
+			return csv.split(",").map((value) => value.trim()).filter((value) => value.length > 0);
+		}
+
+		function renderPairing(data) {
+			const stateEl = document.getElementById("pairingState");
+			const macEl = document.getElementById("pairingMac");
+			const sensorsEl = document.getElementById("pairingSensors");
+			const confirmBtn = document.getElementById("confirmPairBtn");
+
+			sensorsEl.textContent = "";
+
+			if (!data || !data.pending) {
+				stateEl.textContent = data && data.confirmed
+					? "Ostatnie parowanie zostalo potwierdzone."
+					: "Brak oczekujacego zadania parowania.";
+				macEl.textContent = "MAC: " + ((data && data.mac) || "-");
+				confirmBtn.disabled = true;
+				return;
+			}
+
+			stateEl.textContent = "Oczekuje na potwierdzenie nowego urzadzenia.";
+			macEl.textContent = "MAC: " + data.mac;
+			confirmBtn.disabled = false;
+
+			parseSensorsCsv(data.sensors).forEach((sensor) => {
+				const tag = document.createElement("span");
+				tag.className = "sensor-tag";
+				tag.textContent = sensor;
+				sensorsEl.appendChild(tag);
+			});
+		}
+
+		async function refreshPairing() {
+			try {
+				const response = await fetch("/api/pairing", { cache: "no-store" });
+				if (!response.ok) {
+					throw new Error("Pairing HTTP " + response.status);
+				}
+				renderPairing(await response.json());
+			} catch (err) {
+				document.getElementById("pairingState").textContent = "Blad pairing: " + err.message;
+				document.getElementById("confirmPairBtn").disabled = true;
+			}
+		}
+
+		async function confirmPairing() {
+			const status = document.getElementById("status");
+			status.textContent = "Potwierdzanie parowania...";
+
+			try {
+				const response = await fetch("/api/pair/confirm", {
+					method: "POST",
+					cache: "no-store",
+				});
+
+				if (!response.ok) {
+					throw new Error("Confirm HTTP " + response.status);
+				}
+
+				renderPairing(await response.json());
+				status.textContent = "Parowanie potwierdzone.";
+			} catch (err) {
+				status.textContent = "Blad potwierdzenia: " + err.message;
+			}
+		}
+
+		document.getElementById("refreshPairBtn").addEventListener("click", refreshPairing);
+		document.getElementById("confirmPairBtn").addEventListener("click", confirmPairing);
+		refreshPairing();
+		setInterval(refreshPairing, 2000);
+	</script>
+</body>
+</html>
