@@ -123,7 +123,7 @@ config APP_NODE_SOCKET_CLIENT
 
 config APP_NODE_SOCKET_SERVER_IPV4
 	string "Node server IPv4 address"
-	default "172.20.10.2"
+	default "10.42.0.1"
 	help
 	  IPv4 address of the machine running the Node.js TCP server.
 
