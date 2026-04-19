@@ -20,6 +20,7 @@
 #include <zephyr/net/net_config.h>
 #include <zephyr/net/net_mgmt.h>
 #include <zephyr/net/net_event.h>
+#include <zephyr/net/net_if.h>
 #include <zephyr/net/conn_mgr_monitor.h>
 #include <zephyr/net/conn_mgr_connectivity.h>
 
@@ -71,6 +72,27 @@ DNS_SD_REGISTER_TCP_SERVICE(http_server_sd, CONFIG_NET_HOSTNAME, "_http", "local
 /* Zephyr NET management event callback structures. */
 static struct net_mgmt_event_callback l4_cb;
 static struct net_mgmt_event_callback conn_cb;
+
+static void log_boot_interface_mac(void)
+{
+	struct net_if *iface = net_if_get_default();
+	struct net_linkaddr *ll_addr;
+
+	if (iface == NULL) {
+		LOG_WRN("No default network interface available for MAC logging");
+		return;
+	}
+
+	ll_addr = net_if_get_link_addr(iface);
+	if ((ll_addr == NULL) || (ll_addr->addr == NULL) || (ll_addr->len < 6U)) {
+		LOG_WRN("Default interface link-layer address unavailable");
+		return;
+	}
+
+	LOG_INF("Wi-Fi interface MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+		ll_addr->addr[0], ll_addr->addr[1], ll_addr->addr[2],
+		ll_addr->addr[3], ll_addr->addr[4], ll_addr->addr[5]);
+}
 
 struct http_req {
 	struct http_parser parser;
@@ -1316,6 +1338,7 @@ int main(void)
 	}
 
 	LOG_INF("Network interface brought up");
+	log_boot_interface_mac();
 
 	ret = conn_mgr_all_if_connect(true);
 	if (ret) {
