@@ -37,6 +37,7 @@
 #endif
 
 #include "credentials_provision.h"
+#include "ble_central_rx.h"
 #include "data.h"
 #include "node_socket_client.h"
 #include "predictor.h"
@@ -978,6 +979,11 @@ int main(void)
 	}
 
 	parser_init();
+
+	ret = ble_central_rx_start();
+	if (ret) {
+		LOG_ERR("ble_central_rx_start, error: %d", ret);
+	}
 
 #if defined(CONFIG_DK_LIBRARY)
 	ret = dk_leds_init();
