@@ -1,0 +1,11 @@
+source "Kconfig.zephyr"
+
+menu "Application options"
+
+config LOG_SENSORS
+	bool "Enable sensor logs over serial"
+	default y
+	help
+	  Enables periodic sensor value logs on UART/serial monitor.
+
+endmenu
